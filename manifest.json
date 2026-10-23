@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.reflectionist.keycue",
+  "name": "Keycue",
+  "version": "1.0.0",
+  "author": "Reflectionist",
+  "license": "MIT",
+  "description": "Hold Super and a box lists the keys that finish a binding from there, with what each does, and the modifiers that lead to more. Configure it with keycue-config.",
+  "kinds": ["service"],
+  "entryPoints": { "service": "Service.qml" }
+}

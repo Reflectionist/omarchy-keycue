@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Put keycue-config on PATH and in the app launcher, or take it away again.
+#
+#   keycue-link-command link   <plugin-dir>
+#   keycue-link-command unlink <plugin-dir>
+#
+# Run by the Keycue service at start (setting "installCommand"). It only
+# touches what it made itself: ~/.local/bin/keycue-config when that is a
+# symlink into a Keycue plugin folder, and a launcher entry carrying
+# X-Keycue-Managed=true. Anything else at those paths is left alone.
+
+set -u
+
+mode=${1:-}
+plugin_dir=${2:-}
+if [[ $mode != link && $mode != unlink ]] || [[ ! -d $plugin_dir ]]; then
+  echo "usage: keycue-link-command link|unlink <plugin-dir>" >&2
+  exit 2
+fi
+
+target="$plugin_dir/bin/keycue-config"
+bin_dir="$HOME/.local/bin"
+link="$bin_dir/keycue-config"
+apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+desktop="$apps_dir/keycue-config.desktop"
+
+link_is_ours() {
+  [[ -L $link ]] && [[ $(readlink "$link") == */plugins/*keycue*/bin/keycue-config ]]
+}
+
+desktop_is_ours() {
+  [[ -f $desktop ]] && grep -qx 'X-Keycue-Managed=true' "$desktop"
+}
+
+desktop_entry() {
+  local exec_line
+  if command -v omarchy-launch-tui >/dev/null 2>&1; then
+    exec_line="omarchy-launch-tui --app-id=keycue-config \"$target\""
+  else
+    exec_line="\"$target\""
+  fi
+  cat <<EOF
+[Desktop Entry]
+Type=Application
+Name=Keycue Settings
+Comment=Configure the Keycue hotkey suggestions
+Exec=$exec_line
+Icon=input-keyboard
+Terminal=$(command -v omarchy-launch-tui >/dev/null 2>&1 && echo false || echo true)
+Categories=Settings;
+Keywords=keybindings;shortcuts;hotkeys;keycue;
+X-Keycue-Managed=true
+EOF
+}
+
+if [[ $mode == link ]]; then
+  mkdir -p "$bin_dir" "$apps_dir"
+  if [[ ! -e $link && ! -L $link ]] || link_is_ours; then
+    [[ $(readlink "$link" 2>/dev/null) == "$target" ]] || ln -sfn "$target" "$link"
+  fi
+  if [[ ! -e $desktop ]] || desktop_is_ours; then
+    entry=$(desktop_entry)
+    if [[ ! -f $desktop ]] || [[ $(<"$desktop") != "$entry" ]]; then
+      tmp=$(mktemp "$apps_dir/.keycue-config.XXXXXX")
+      printf '%s\n' "$entry" >"$tmp" && mv -f "$tmp" "$desktop"
+    fi
+  fi
+else
+  link_is_ours && rm -f "$link"
+  desktop_is_ours && rm -f "$desktop"
+fi
+exit 0

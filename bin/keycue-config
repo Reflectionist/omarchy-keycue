@@ -1,0 +1,1347 @@
+#!/usr/bin/env python3
+"""keycue-config: settings for the Keycue Omarchy plugin.
+
+A full-screen terminal app (Python standard library only). The settings are
+on the left, and a live copy of the box on the right. Every change is saved
+to ~/.config/omarchy/keycue.jsonc at once, and the plugin reloads it.
+
+Keys: ↑↓ move · ←→ change · enter edit · x reset · tab level · p preview on
+screen · e open the file in your editor · r revert this session · q quit
+
+  --config PATH       edit another file (for tests)
+  --snapshot WxH      draw one frame to stdout and exit (for tests)
+  --keys KEYS         with --snapshot: keys to apply first, e.g. "jj<right><enter>"
+  --no-ipc            don't talk to the running plugin
+"""
+
+import json
+import math
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import unicodedata
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
+
+PLUGIN_ID = "io.github.reflectionist.keycue"
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HOME = os.path.expanduser("~")
+DEFAULT_CONFIG = os.path.join(HOME, ".config", "omarchy", "keycue.jsonc")
+THEME_DIR = os.path.join(HOME, ".local", "state", "omarchy", "current", "theme")
+
+SUPER, SHIFT, CTRL, ALT = 64, 1, 4, 8
+LEVELS = [
+    ("Super", SUPER), ("Super Shift", SUPER | SHIFT), ("Super Ctrl", SUPER | CTRL),
+    ("Super Alt", SUPER | ALT), ("Super Shift Alt", SUPER | SHIFT | ALT),
+    ("Super Ctrl Alt", SUPER | CTRL | ALT), ("Super Shift Ctrl", SUPER | SHIFT | CTRL),
+]
+
+
+# ---------------------------------------------------------------- schema
+
+def load_schema():
+    """The JSON object assigned in Schema.js (single source of truth)."""
+    text = open(os.path.join(PLUGIN_DIR, "Schema.js"), encoding="utf-8").read()
+    start = text.index("{", text.index("var SCHEMA"))
+    return json.loads(text[start:text.rindex("}") + 1])
+
+
+def parse_jsonc(text):
+    """JSON with comments and trailing commas; None when it isn't valid."""
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if in_str:
+            out.append(c)
+            if c == "\\":
+                out.append(nxt)
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+        elif c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif c == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and nxt == "*":
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        else:
+            out.append(c)
+            i += 1
+    body = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    if not body.strip():
+        return {}
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def coerce(opt, value):
+    """Mirror of KeycueModel.js coerce(): a valid value or the default."""
+    d = opt["default"]
+    d = list(d) if isinstance(d, list) else (dict(d) if isinstance(d, dict) else d)
+    if value is None:
+        return d
+    t = opt["type"]
+    if t in ("int", "float"):
+        if isinstance(value, bool):
+            return d
+        try:
+            n = float(str(value).rstrip().rstrip("%")) if isinstance(value, str) else float(value)
+        except ValueError:
+            return d
+        if opt.get("unit") == "%" and 0 < n < 1:
+            n *= 100
+        n = round(n) if t == "int" else n
+        return max(opt["min"], min(opt["max"], n))
+    if t == "bool":
+        return value if isinstance(value, bool) else d
+    if t == "enum":
+        return value if value in [c["value"] for c in opt["choices"]] else d
+    if t == "flags":
+        if not isinstance(value, list):
+            return d
+        allowed = [c["value"] for c in opt["choices"]]
+        picked = [v for i, v in enumerate(value) if v in allowed and v not in value[:i]]
+        return picked or d
+    if t == "string":
+        return value if isinstance(value, str) else d
+    if t == "color":
+        return value.strip() if isinstance(value, str) and value.strip() else d
+    if t == "list":
+        return [x for x in value if isinstance(x, str) and x] if isinstance(value, list) else d
+    if t == "map":
+        return {k: v for k, v in value.items() if isinstance(v, str)} if isinstance(value, dict) else d
+    return d
+
+
+def render_config(schema, values, extra):
+    """The whole config file, every option with a comment explaining it."""
+    lines = [
+        "// Keycue settings.",
+        "// Edit with keycue-config, or by hand; the plugin reloads this file on save.",
+        "// Every option is listed with its default. Comments are regenerated when",
+        "// keycue-config saves, so keep notes elsewhere.",
+        "{",
+    ]
+    entries = []
+    for cat in schema["categories"]:
+        opts = [o for o in schema["options"] if o["category"] == cat["id"]]
+        entries.append(("cat", cat))
+        for o in opts:
+            entries.append(("opt", o))
+    for key in extra:
+        entries.append(("extra", key))
+    count = sum(1 for e in entries if e[0] != "cat")
+    written = 0
+    for kind, item in entries:
+        if kind == "cat":
+            title = item["title"]
+            lines.append("")
+            lines.append("  // ── " + title + " " + "─" * max(3, 60 - len(title)))
+            continue
+        written += 1
+        comma = "," if written < count else ""
+        if kind == "extra":
+            lines.append("")
+            lines.append("  // Not a Keycue option; kept as written.")
+            lines.append("  " + json.dumps(item) + ": " + json.dumps(extra[item], ensure_ascii=False) + comma)
+            continue
+        o = item
+        lines.append("")
+        lines.append("  // " + describe_range(o))
+        for chunk in wrap(o["description"], 74):
+            lines.append("  // " + chunk)
+        value = values[o["key"]]
+        dumped = json.dumps(value, ensure_ascii=False)
+        if isinstance(value, (list, dict)) and value:
+            dumped = json.dumps(value, ensure_ascii=False, indent=2).replace("\n", "\n  ")
+        if isinstance(value, float):
+            dumped = ("%.2f" % value).rstrip("0").rstrip(".")
+        lines.append("  " + json.dumps(o["key"]) + ": " + dumped + comma)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def describe_range(o):
+    t = o["type"]
+    parts = [o["title"]]
+    if t in ("int", "float"):
+        unit = o.get("unit", "")
+        rng = "%s–%s%s" % (fmt_num(o["min"]), fmt_num(o["max"]), (" " + unit) if unit and unit != "%" else unit)
+        parts.append(rng)
+        for raw, label in o.get("special", {}).items():
+            parts.append("%s = %s" % (raw, label))
+    elif t in ("enum", "flags"):
+        parts.append(" | ".join(c["value"] for c in o["choices"]))
+    elif t == "bool":
+        parts.append("true | false")
+    elif t == "color":
+        parts.append('"theme", a theme colour name, or "#rrggbb"')
+    elif t == "list":
+        parts.append("list of " + o.get("itemLabel", "string") + "s")
+    elif t == "map":
+        parts.append("%s → %s" % (o.get("keyLabel", "key"), o.get("valueLabel", "value")))
+    parts.append("default " + json.dumps(o["default"], ensure_ascii=False))
+    return " · ".join(parts)
+
+
+def fmt_num(n):
+    return ("%.2f" % n).rstrip("0").rstrip(".") if isinstance(n, float) else str(n)
+
+
+def wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if line and len(line) + 1 + len(w) > width:
+            out.append(line)
+            line = w
+        else:
+            line = (line + " " + w) if line else w
+    if line:
+        out.append(line)
+    return out or [""]
+
+
+# ----------------------------------------------------------------- theme
+
+def load_theme():
+    path = os.path.join(THEME_DIR, "colors.toml")
+    roles = {}
+    try:
+        raw = open(path, "rb").read()
+        data = tomllib.loads(raw.decode()) if tomllib else {}
+        if not data:
+            for m in re.finditer(r'^\s*(\w+)\s*=\s*"(#[0-9A-Fa-f]{6})', raw.decode(), re.M):
+                roles[m.group(1)] = m.group(2)
+        for k, v in data.items():
+            if isinstance(v, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", v):
+                roles[k] = v[:7]
+    except OSError:
+        pass
+    name = ""
+    try:
+        name = open(os.path.join(os.path.dirname(THEME_DIR), "theme.name")).read().strip()
+    except OSError:
+        try:
+            name = os.path.basename(os.path.realpath(THEME_DIR))
+        except OSError:
+            pass
+    return roles, name
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) == 8:  # Qt's #aarrggbb
+        h = h[2:]
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except (ValueError, IndexError):
+        return 200, 200, 200
+
+
+def qt_alpha(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16) / 255 if len(h) == 8 else 1.0
+
+
+def mix(a, b, t):
+    return tuple(round(x * t + y * (1 - t)) for x, y in zip(a, b))
+
+
+def resolve_color(value, roles):
+    v = (value or "").strip()
+    if v in ("", "theme"):
+        return None
+    if re.fullmatch(r"#[0-9A-Fa-f]{3}", v):
+        return "#" + "".join(c * 2 for c in v[1:])
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", v):
+        return v
+    return roles.get(v)
+
+
+# ------------------------------------------------------------- terminal
+
+def fg(rgb):
+    return "\x1b[38;2;%d;%d;%dm" % rgb
+
+
+def bg(rgb):
+    return "\x1b[48;2;%d;%d;%dm" % rgb
+
+
+RESET, BOLD, DIM, ITALIC = "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[3m"
+
+
+def cwidth(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def swidth(s):
+    return sum(cwidth(c) for c in strip_ansi(s))
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(s):
+    return ANSI_RE.sub("", s)
+
+
+def clip(s, width):
+    """Cut a plain string to `width` cells, with an ellipsis if cut."""
+    if swidth(s) <= width:
+        return s
+    out, used = "", 0
+    for c in s:
+        w = cwidth(c)
+        if used + w > width - 1:
+            break
+        out += c
+        used += w
+    return out + "…"
+
+
+def pad(s, width):
+    """Pad (or cut) a string that may contain colour codes to `width` cells."""
+    w = swidth(s)
+    if w <= width:
+        return s + " " * (width - w)
+    out, used, i = "", 0, 0
+    while i < len(s) and used < width:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out += m.group(0)
+            i = m.end()
+            continue
+        cw = cwidth(s[i])
+        if used + cw > width:
+            break
+        out += s[i]
+        used += cw
+        i += 1
+    return out + RESET + " " * (width - used)
+
+
+KEYS = {
+    "\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left",
+    "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left",
+    "\x1b[H": "home", "\x1b[F": "end", "\x1b[1~": "home", "\x1b[4~": "end",
+    "\x1b[5~": "pgup", "\x1b[6~": "pgdn", "\x1b[3~": "delete", "\x1b[Z": "backtab",
+    "\x1b[1;2C": "shift-right", "\x1b[1;2D": "shift-left",
+    "\r": "enter", "\n": "enter", "\t": "tab", "\x7f": "backspace", "\x08": "backspace",
+    "\x1b": "esc", " ": "space", "\x03": "ctrl-c", "\x15": "ctrl-u",
+}
+
+
+def split_keys(data):
+    """Turn raw terminal bytes into key names (or single characters)."""
+    out, i = [], 0
+    while i < len(data):
+        if data[i] == "\x1b":
+            for length in (6, 5, 4, 3, 2):
+                seq = data[i:i + length]
+                if seq in KEYS:
+                    out.append(KEYS[seq])
+                    i += length
+                    break
+            else:
+                out.append("esc")
+                i += 1
+            continue
+        out.append(KEYS.get(data[i], data[i]))
+        i += 1
+    return out
+
+
+def parse_key_script(script):
+    """'jj<right><enter>abc' -> ['j', 'j', 'right', 'enter', 'a', 'b', 'c']."""
+    out = []
+    for m in re.finditer(r"<([a-z-]+)>|(.)", script, re.S):
+        out.append(m.group(1) or KEYS.get(m.group(2), m.group(2)))
+    return out
+
+
+# ------------------------------------------------------------------- IPC
+
+class Plugin:
+    """Talks to the running plugin through omarchy-shell, off the UI thread."""
+
+    def __init__(self, enabled, on_update):
+        self.enabled = enabled and shutil.which("omarchy-shell") is not None
+        self.on_update = on_update
+        self.state = None
+        self.fetched = False
+        self.levels = {}
+        self.previewing = None
+        self.lock = threading.Lock()
+        self.queue = []
+        self.event = threading.Event()
+        if self.enabled:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def call(self, *args, timeout=3):
+        try:
+            out = subprocess.run(["omarchy-shell", PLUGIN_ID] + [str(a) for a in args],
+                                 capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    def request(self, *job):
+        if not self.enabled:
+            return
+        with self.lock:
+            if job not in self.queue:
+                self.queue.append(job)
+        self.event.set()
+
+    def refresh(self, mask):
+        self.request("reload-config")
+        self.request("state")
+        self.request("level", mask)
+        if self.previewing is not None:
+            self.request("preview", self.previewing)
+
+    def _run(self):
+        while True:
+            self.event.wait()
+            with self.lock:
+                job = self.queue.pop(0) if self.queue else None
+                if not self.queue:
+                    self.event.clear()
+            if job is None:
+                continue
+            kind = job[0]
+            if kind == "reload-config":
+                self.call("reloadConfig")
+                time.sleep(0.05)
+            elif kind == "state":
+                out = self.call("state")
+                try:
+                    self.state = json.loads(out) if out else None
+                except ValueError:
+                    self.state = None
+                self.fetched = True
+            elif kind == "level":
+                out = self.call("level", job[1])
+                try:
+                    self.levels[job[1]] = json.loads(out) if out else None
+                except ValueError:
+                    self.levels[job[1]] = None
+            elif kind == "preview":
+                self.call("preview", job[1] & ~SUPER)
+            elif kind == "hide":
+                self.call("hide")
+            self.on_update()
+
+
+# ------------------------------------------------------------------- app
+
+class App:
+    def __init__(self, config_path, use_ipc, width=None, height=None):
+        self.schema = load_schema()
+        self.options = self.schema["options"]
+        self.config_path = config_path
+        self.roles, self.theme_name = load_theme()
+        self.palette()
+        self.fixed_size = (width, height) if width else None
+        self.cursor = 0
+        self.scroll = 0
+        self.level_index = 0
+        self.message = ""
+        self.message_time = 0
+        self.overlay = None
+        self.dirty = True
+        self.save_due = 0
+        self.wake_r, self.wake_w = os.pipe()
+        self.plugin = Plugin(use_ipc, self.wake)
+        self.load()
+        self.original_text = self.file_text
+        self.plugin.refresh(self.mask())
+
+    # ---- data
+
+    def palette(self):
+        r = self.roles
+        def c(*names, default="#cccccc"):
+            for n in names:
+                if n in r:
+                    return hex_rgb(r[n])
+            return hex_rgb(default)
+        self.c_fg = c("foreground")
+        self.c_bg = c("background", default="#1e1e2e")
+        self.c_accent = c("accent", "blue")
+        self.c_muted = c("muted", "dark_foreground", default="#707880")
+        self.c_dim = mix(self.c_fg, self.c_bg, 0.55)
+        self.c_sel = c("selection", "lighter_background", default="#333344")
+        self.c_red = c("red", default="#e06c75")
+        self.c_green = c("green", default="#98c379")
+        self.c_yellow = c("yellow", default="#e5c07b")
+
+    def load(self):
+        try:
+            self.file_text = open(self.config_path, encoding="utf-8").read()
+        except OSError:
+            self.file_text = ""
+        parsed = parse_jsonc(self.file_text)
+        self.broken = parsed is None
+        parsed = parsed or {}
+        known = {o["key"] for o in self.options}
+        self.values = {o["key"]: coerce(o, parsed.get(o["key"])) for o in self.options}
+        self.extra = {k: v for k, v in parsed.items() if k not in known}
+
+    def save(self):
+        if self.broken:
+            self.flash("The config file has errors; fix it with e, or press R to start fresh.", error=True)
+            return
+        text = render_config(self.schema, self.values, self.extra)
+        if text != self.file_text:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            tmp = self.config_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, self.config_path)
+            self.file_text = text
+        self.plugin.refresh(self.mask())
+
+    def changed(self):
+        self.save_due = time.monotonic() + 0.25
+        self.dirty = True
+
+    def mask(self):
+        return LEVELS[self.level_index][1]
+
+    def flash(self, text, error=False):
+        self.message = (fg(self.c_red) if error else fg(self.c_green)) + text + RESET
+        self.message_time = time.monotonic()
+        self.dirty = True
+
+    def wake(self):
+        self.dirty = True
+        try:
+            os.write(self.wake_w, b"x")
+        except OSError:
+            pass
+
+    # ---- values
+
+    def display(self, o, value=None):
+        v = self.values[o["key"]] if value is None else value
+        t = o["type"]
+        special = o.get("special", {})
+        if t in ("int", "float"):
+            if str(v) in special or fmt_num(v) in special:
+                return special.get(str(v), special.get(fmt_num(v)))
+            unit = o.get("unit", "")
+            return fmt_num(v) + ("" if not unit else ("%" if unit == "%" else (unit if unit == "×" else " " + unit)))
+        if t == "bool":
+            return "● on" if v else "○ off"
+        if t == "enum":
+            for c in o["choices"]:
+                if c["value"] == v:
+                    return c["label"]
+            return str(v)
+        if t == "flags":
+            labels = {c["value"]: c["label"] for c in o["choices"]}
+            return " + ".join(labels.get(x, x) for x in v)
+        if t == "string":
+            return v if v else (o.get("placeholder") or "(empty)")
+        if t == "color":
+            return v
+        if t == "list":
+            return "%d item%s" % (len(v), "" if len(v) == 1 else "s") if v else "none"
+        if t == "map":
+            return "%d entr%s" % (len(v), "y" if len(v) == 1 else "ies") if v else "none"
+        return str(v)
+
+    def is_default(self, o):
+        return self.values[o["key"]] == o["default"]
+
+    def step(self, o, direction, big=False):
+        key, t, v = o["key"], o["type"], self.values[o["key"]]
+        if t in ("int", "float"):
+            step = o.get("step", 1) * (10 if big else 1)
+            special = o.get("special", {})
+            if fmt_num(v) in special and direction > 0 and v < 0:
+                n = 0  # "auto" / "theme" -> the first real value
+            elif direction > 0:
+                n = (math.floor(v / step + 1e-9) + 1) * step
+            else:
+                n = (math.ceil(v / step - 1e-9) - 1) * step
+            if t == "float":
+                n = round(n, 4)
+            self.values[key] = max(o["min"], min(o["max"], n))
+        elif t == "bool":
+            self.values[key] = not v
+        elif t == "enum":
+            vals = [c["value"] for c in o["choices"]]
+            i = vals.index(v) if v in vals else 0
+            self.values[key] = vals[(i + direction) % len(vals)]
+        elif t == "color":
+            names = ["theme"] + sorted(self.roles)
+            i = names.index(v) if v in names else 0
+            self.values[key] = names[(i + direction) % len(names)]
+        else:
+            return
+        self.changed()
+
+    def reset(self, o):
+        d = o["default"]
+        self.values[o["key"]] = list(d) if isinstance(d, list) else (dict(d) if isinstance(d, dict) else d)
+        self.changed()
+
+    # ---- editing overlays
+
+    def edit(self, o):
+        t = o["type"]
+        if t in ("bool", "enum"):
+            self.step(o, 1)
+        elif t == "flags":
+            self.overlay = FlagsEditor(self, o)
+        elif t == "list":
+            self.overlay = ListEditor(self, o)
+        elif t == "map":
+            self.overlay = MapEditor(self, o)
+        else:
+            current = self.values[o["key"]]
+            text = fmt_num(current) if t in ("int", "float") else str(current)
+            self.overlay = TextPrompt(self, o["title"], text, lambda s: self.set_typed(o, s), hint=describe_range(o))
+
+    def set_typed(self, o, text):
+        t = o["type"]
+        if t in ("int", "float"):
+            special = {label: raw for raw, label in o.get("special", {}).items()}
+            raw = special.get(text.strip(), text)
+            try:
+                n = float(str(raw).strip().rstrip("%"))
+            except ValueError:
+                self.flash("Not a number: " + text, error=True)
+                return
+            self.values[o["key"]] = coerce(o, n)
+        elif t == "color":
+            if text.strip() in ("", "theme") or resolve_color(text, self.roles):
+                self.values[o["key"]] = text.strip() or "theme"
+            else:
+                self.flash("Use theme, a theme colour name (%s, …) or #rrggbb." % ", ".join(sorted(self.roles)[:4]), error=True)
+                return
+        else:
+            self.values[o["key"]] = text
+        self.changed()
+
+    # ---- actions
+
+    def open_editor(self):
+        if self.save_due:
+            self.save_due = 0
+            self.save()
+        if not os.path.exists(self.config_path):
+            self.save()
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if editor:
+            cmd = shlex.split(editor) + [self.config_path]
+        elif shutil.which("omarchy-launch-editor"):
+            cmd = ["omarchy-launch-editor", self.config_path]
+        else:
+            cmd = ["xdg-open", self.config_path]
+        self.term.suspend()
+        try:
+            subprocess.run(cmd)
+        except OSError as e:
+            self.flash("Couldn't start %s: %s" % (cmd[0], e), error=True)
+        finally:
+            self.term.resume()
+        self.load()
+        if self.broken:
+            self.flash("The file has errors now; Keycue uses the defaults until they're fixed.", error=True)
+        else:
+            self.flash("Reloaded the file.")
+        self.plugin.refresh(self.mask())
+
+    def toggle_preview(self):
+        if self.plugin.previewing is None:
+            self.plugin.previewing = self.mask()
+            self.plugin.request("preview", self.mask())
+            self.flash("Showing the box on screen; p hides it.")
+        else:
+            self.plugin.previewing = None
+            self.plugin.request("hide")
+            self.flash("Preview hidden.")
+
+    def revert(self):
+        if self.original_text == "":
+            try:
+                os.remove(self.config_path)
+            except OSError:
+                pass
+            self.file_text = ""
+        else:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                f.write(self.original_text)
+            self.file_text = self.original_text
+        self.load()
+        self.save_due = 0
+        self.flash("Reverted to the file as it was when keycue-config started.")
+        self.plugin.refresh(self.mask())
+
+    def start_fresh(self):
+        self.broken = False
+        self.extra = {}
+        for o in self.options:
+            self.reset(o)
+        self.flash("Started from the defaults.")
+
+    def handle(self, key):
+        if self.overlay:
+            self.overlay.handle(key)
+            self.dirty = True
+            return True
+        o = self.options[self.cursor]
+        if key in ("q", "esc", "ctrl-c"):
+            return False
+        if key in ("down", "j"):
+            self.cursor = min(len(self.options) - 1, self.cursor + 1)
+        elif key in ("up", "k"):
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "pgdn":
+            self.cursor = min(len(self.options) - 1, self.cursor + 10)
+        elif key == "pgup":
+            self.cursor = max(0, self.cursor - 10)
+        elif key in ("home", "g"):
+            self.cursor = 0
+        elif key in ("end", "G"):
+            self.cursor = len(self.options) - 1
+        elif key in ("right", "l"):
+            self.step(o, 1)
+        elif key in ("left", "h"):
+            self.step(o, -1)
+        elif key == "shift-right":
+            self.step(o, 1, big=True)
+        elif key == "shift-left":
+            self.step(o, -1, big=True)
+        elif key in ("enter", "space"):
+            if key == "space" and o["type"] not in ("bool", "enum", "flags"):
+                return True
+            self.edit(o)
+        elif key in ("x", "delete", "backspace"):
+            self.reset(o)
+        elif key == "tab":
+            self.level_index = (self.level_index + 1) % len(LEVELS)
+            self.after_level()
+        elif key == "backtab":
+            self.level_index = (self.level_index - 1) % len(LEVELS)
+            self.after_level()
+        elif key == "p":
+            self.toggle_preview()
+        elif key == "e":
+            self.open_editor()
+        elif key == "r":
+            self.revert()
+        elif key == "R":
+            self.start_fresh()
+        elif key == "]":
+            self.next_category(1)
+        elif key == "[":
+            self.next_category(-1)
+        self.dirty = True
+        return True
+
+    def after_level(self):
+        self.plugin.request("level", self.mask())
+        if self.plugin.previewing is not None:
+            self.plugin.previewing = self.mask()
+            self.plugin.request("preview", self.mask())
+
+    def next_category(self, direction):
+        cats = [c["id"] for c in self.schema["categories"]]
+        cur = cats.index(self.options[self.cursor]["category"])
+        target = cats[(cur + direction) % len(cats)]
+        self.cursor = next(i for i, o in enumerate(self.options) if o["category"] == target)
+
+    # ---- drawing
+
+    def size(self):
+        if self.fixed_size:
+            return self.fixed_size
+        s = shutil.get_terminal_size((100, 30))
+        return s.columns, s.lines
+
+    def frame(self):
+        W, H = self.size()
+        A, F, D, M = fg(self.c_accent), fg(self.c_fg), fg(self.c_dim), fg(self.c_muted)
+        lines = []
+
+        # Header
+        state = self.plugin.state
+        if not self.plugin.enabled:
+            status = M + "○ offline"
+        elif state is None and not self.plugin.fetched:
+            status = M + "○ connecting"
+        elif state is None:
+            status = fg(self.c_yellow) + "○ Keycue isn't running"
+        elif state.get("watcher") == "ready":
+            status = fg(self.c_green) + "● watching keys"
+        elif state.get("watcher") == "failed":
+            status = fg(self.c_red) + "● key watcher failed"
+        else:
+            status = fg(self.c_yellow) + "○ starting"
+        title = " " + A + BOLD + "❖ keycue" + RESET + D + "  ·  settings" + RESET
+        right = (D + "theme " + F + self.theme_name + "   " if self.theme_name else "") + status + RESET + " "
+        lines.append(pad(title, W - swidth(right)) + right)
+        lines.append(D + "─" * W + RESET)
+
+        body_h = max(5, H - 6)
+        left_w = max(34, min(54, W * 46 // 100))
+        right_w = W - left_w - 3
+
+        left = self.settings_pane(left_w, body_h)
+        right = self.mock_pane(right_w, body_h)
+        for i in range(body_h):
+            lines.append(pad(left[i] if i < len(left) else "", left_w) + " " + D + "│" + RESET + " " + pad(right[i] if i < len(right) else "", right_w))
+
+        # Footer: description, message, keys
+        o = self.options[self.cursor]
+        lines.append(D + "─" * W + RESET)
+        if state and state.get("watcher") == "failed" and time.monotonic() - self.message_time > 4:
+            info = fg(self.c_red) + clip(state.get("reason", ""), W - 2) + RESET
+        elif self.message and time.monotonic() - self.message_time < 4:
+            info = self.message
+        elif self.broken:
+            info = fg(self.c_red) + "The config file has errors: changes aren't saved. e opens it, R starts from the defaults." + RESET
+        else:
+            default = "  " + D + "default " + self.display(o, o["default"]) + RESET
+            info = F + clip(o["description"], W - 4 - swidth(default)) + RESET + default
+        lines.append(" " + info)
+        keys = [("↑↓", "move"), ("←→", "change"), ("enter", "edit"), ("x", "reset"),
+                ("tab", "level"), ("p", "preview" if self.plugin.previewing is None else "hide preview"),
+                ("e", "open file"), ("r", "revert"), ("q", "quit")]
+        hint = "  ".join(A + k + RESET + " " + D + v + RESET for k, v in keys)
+        lines.append(" " + pad(hint, W - 1))
+
+        if self.overlay:
+            lines = [fg(self.c_dim) + strip_ansi(line) + RESET for line in lines]
+            self.overlay.draw(lines, W, H)
+        return lines[:H]
+
+    def settings_pane(self, width, height):
+        A, F, D, M = fg(self.c_accent), fg(self.c_fg), fg(self.c_dim), fg(self.c_muted)
+        rows = []  # (option index or None, text)
+        last_cat = None
+        cats = {c["id"]: c for c in self.schema["categories"]}
+        for i, o in enumerate(self.options):
+            if o["category"] != last_cat:
+                if last_cat is not None:
+                    rows.append((None, ""))
+                rows.append((None, " " + A + BOLD + cats[o["category"]]["title"].upper() + RESET))
+                last_cat = o["category"]
+            rows.append((i, None))
+        cursor_row = next(r for r, (i, _) in enumerate(rows) if i == self.cursor)
+        if cursor_row < self.scroll + 2:
+            self.scroll = max(0, cursor_row - 2)
+        if cursor_row >= self.scroll + height - 2:
+            self.scroll = min(max(0, len(rows) - height), cursor_row - height + 3)
+        value_w = max(12, width * 2 // 5)
+        out = []
+        for i, text in rows[self.scroll:self.scroll + height]:
+            if i is None:
+                out.append(text)
+                continue
+            o = self.options[i]
+            selected = i == self.cursor
+            mark = A + "●" if not self.is_default(o) else " "
+            name = clip(o["title"], width - value_w - 5)
+            value = self.value_cell(o, value_w)
+            line = " " + mark + RESET + " " + (F + BOLD if selected else F) + pad(name, width - value_w - 4) + RESET + value
+            if selected:
+                line = bg(self.c_sel) + A + "▌" + RESET + bg(self.c_sel) + strip_to_sel(pad(line[1:] if line.startswith(" ") else line, width - 1), self.c_sel) + RESET
+            out.append(line)
+        if len(rows) > height:
+            # Scroll position in the last line's corner.
+            pct = int(100 * self.scroll / max(1, len(rows) - height))
+            out[-1] = pad(out[-1], width - 5) + D + ("%3d%%" % pct) + RESET
+        return out
+
+    def value_cell(self, o, width):
+        A, F, D = fg(self.c_accent), fg(self.c_fg), fg(self.c_dim)
+        t = o["type"]
+        text = self.display(o)
+        if t == "color":
+            hexv = resolve_color(self.values[o["key"]], self.roles)
+            if not hexv:
+                # "theme": show the colour the plugin actually uses.
+                level = self.plugin.levels.get(self.mask()) or {}
+                field = {"backgroundColor": "background", "textColor": "text", "mutedColor": "muted",
+                         "keyColor": "key", "borderColor": "border"}.get(o["key"])
+                hexv = (level.get("style") or {}).get(field)
+            swatch = (fg(hex_rgb(hexv)) + "██" + RESET + " ") if hexv else "   "
+            return swatch + (D if text == "theme" else F) + clip(text, width - 3) + RESET
+        if t in ("list", "map", "flags"):
+            return A + clip(text, width - 2) + D + " ›" + RESET
+        if t == "string" and not self.values[o["key"]]:
+            return D + ITALIC + clip(text, width) + RESET
+        arrows = t in ("int", "float", "enum", "bool")
+        if arrows:
+            return D + "‹ " + RESET + A + clip(text, width - 4) + RESET + D + " ›" + RESET
+        return F + clip(text, width) + RESET
+
+    def mock_pane(self, width, height):
+        D, F, A = fg(self.c_dim), fg(self.c_fg), fg(self.c_accent)
+        name, mask = LEVELS[self.level_index]
+        out = [D + "Preview " + RESET + A + name + RESET + D + "  (tab: next level)" + RESET, ""]
+        level = self.plugin.levels.get(mask)
+        if level is None:
+            if not self.plugin.enabled:
+                msg = "Live preview needs omarchy-shell."
+            elif self.plugin.state is None and self.plugin.fetched:
+                msg = "Keycue isn't running. Enable it with: omarchy plugin enable " + PLUGIN_ID
+            else:
+                msg = "Loading…"
+            out += [D + line + RESET for line in wrap(msg, width - 2)]
+            return out
+        out += self.draw_box(level, width, height - 2)
+        return out
+
+    def draw_box(self, level, width, height):
+        v = self.values
+        style = level.get("style", {})
+        term_bg = self.c_bg
+        def color(name, fallback):
+            h = style.get(name)
+            return hex_rgb(h) if h else fallback
+        box_bg = mix(color("background", self.c_bg), term_bg, qt_alpha(style.get("background", "#ff000000")) if style.get("background") else 1)
+        text_c = color("text", self.c_fg)
+        muted_c = color("muted", self.c_dim)
+        key_c = color("key", self.c_accent)
+        onkey_c = color("onKey", self.c_bg)
+        border_c = color("border", self.c_accent)
+        bordered = style.get("borderWidth", 1) > 0
+        rounded = style.get("radius", 0) > 0
+        key_style = v["keyStyle"]
+
+        def cap(label, held=False):
+            if key_style == "brackets":
+                return fg(key_c) + BOLD + "[" + label + "]" + RESET + bg(box_bg)
+            if key_style == "plain":
+                return fg(key_c) + BOLD + label + RESET + bg(box_bg)
+            if key_style == "filled" or held:
+                return bg(key_c) + fg(onkey_c) + BOLD + " " + label + " " + RESET + bg(box_bg)
+            return bg(mix(key_c, box_bg, 0.18)) + fg(key_c) + BOLD + " " + label + " " + RESET + bg(box_bg)
+
+        def cap_w(label):
+            return swidth(label) + (2 if key_style in ("outlined", "filled") else (2 if key_style == "brackets" else 0))
+
+        inner = []
+        if v["showHeader"]:
+            parts = []
+            for h in level.get("held", []):
+                parts.append(cap(h["label"], held=True))
+            header = (fg(muted_c) + " + " + RESET + bg(box_bg)).join(parts) + fg(muted_c) + " + …"
+            inner.append(header)
+            inner.append("RULE")
+        rows = level.get("rows", [])
+        if not rows:
+            inner.append(fg(muted_c) + v["emptyText"])
+        keycol = max([cap_w(r["label"]) for r in rows] + [1])
+        max_inner = width - 6
+        avail = height - (2 if bordered else 0) - len(inner) - (2 if v["showFooter"] and level.get("deeper") else 0)
+        shown = rows if len(rows) <= avail else rows[:max(1, avail - 1)]
+        for r in shown:
+            label = cap(r["label"])
+            gap = " " * (keycol - cap_w(r["label"]) + 2)
+            inner.append(label + gap + fg(text_c) + clip(r["desc"], max(4, max_inner - keycol - 2)))
+        if len(shown) < len(rows):
+            inner.append(fg(muted_c) + "… %d more" % (len(rows) - len(shown)))
+        deeper = level.get("deeper", [])
+        if v["showFooter"] and deeper:
+            parts = []
+            for d in deeper:
+                count = d.get("count")
+                num = "" if count is None else (" " + fg(muted_c) + (str(count) if count > 0 else "…"))
+                parts.append(cap(d["label"]) + num + RESET + bg(box_bg))
+            inner.append("")
+            inner.append("  ".join(parts))
+        content_w = min(max_inner, max(swidth(x) for x in inner if x != "RULE") if inner else 10)
+        out = []
+        b = fg(border_c) + bg(box_bg) if bordered else bg(box_bg)
+        tl, tr, bl, br = ("╭", "╮", "╰", "╯") if rounded else ("┌", "┐", "└", "┘")
+        if bordered:
+            out.append(b + tl + "─" * (content_w + 2) + tr + RESET)
+        for line in inner:
+            if line == "RULE":
+                body = fg(mix(muted_c, box_bg, 0.5)) + "─" * content_w
+            else:
+                body = line
+            cell = bg(box_bg) + " " + pad(bg(box_bg) + body, content_w).replace(RESET, RESET + bg(box_bg)) + bg(box_bg) + " "
+            out.append((b + "│" + RESET if bordered else "") + cell + (b + "│" if bordered else "") + RESET)
+        if bordered:
+            out.append(b + bl + "─" * (content_w + 2) + br + RESET)
+        return out
+
+    # ---- loop
+
+    def run(self):
+        self.term = Terminal()
+        self.term.enter()
+        signal.signal(signal.SIGWINCH, lambda *_: self.wake())
+        try:
+            while True:
+                if self.dirty:
+                    self.term.draw(self.frame())
+                    self.dirty = False
+                timeout = 0.2
+                if self.save_due:
+                    timeout = max(0.0, self.save_due - time.monotonic())
+                ready, _, _ = select.select([sys.stdin, self.wake_r], [], [], timeout)
+                if self.wake_r in ready:
+                    os.read(self.wake_r, 1024)
+                    self.dirty = True
+                if sys.stdin in ready:
+                    data = os.read(sys.stdin.fileno(), 1024).decode(errors="replace")
+                    # A lone ESC may be the start of a sequence still arriving.
+                    if data == "\x1b" and select.select([sys.stdin], [], [], 0.03)[0]:
+                        data += os.read(sys.stdin.fileno(), 1024).decode(errors="replace")
+                    for key in split_keys(data):
+                        if not self.handle(key):
+                            return
+                if self.save_due and time.monotonic() >= self.save_due:
+                    self.save_due = 0
+                    self.save()
+                if self.message and time.monotonic() - self.message_time > 4:
+                    self.message = ""
+                    self.dirty = True
+        finally:
+            if self.save_due:
+                self.save()
+            if self.plugin.previewing is not None:
+                self.plugin.call("hide")
+            self.term.leave()
+
+
+def strip_to_sel(s, sel):
+    """Keep the selection background behind text that resets colours."""
+    return s.replace(RESET, RESET + bg(sel))
+
+
+class Terminal:
+    def enter(self):
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J")
+        sys.stdout.flush()
+
+    def leave(self):
+        sys.stdout.write(RESET + "\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def suspend(self):
+        self.leave()
+
+    def resume(self):
+        self.enter()
+
+    def draw(self, lines):
+        out = ["\x1b[H"]
+        for i, line in enumerate(lines):
+            out.append(line + RESET + "\x1b[K" + ("\r\n" if i < len(lines) - 1 else ""))
+        out.append("\x1b[J")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+
+# --------------------------------------------------------------- overlays
+
+class Overlay:
+    def box(self, lines, W, H, title, body, width=None):
+        app = self.app
+        A, D = fg(app.c_accent), fg(app.c_dim)
+        w = min(W - 4, width or max(40, max([swidth(b) for b in body] + [swidth(title) + 4]) + 4))
+        h = min(H - 2, len(body) + 2)
+        top = max(1, (H - h) // 2)
+        left = max(0, (W - w) // 2)
+        frame = [A + "╭─ " + BOLD + title + RESET + A + " " + "─" * max(0, w - swidth(title) - 5) + "╮" + RESET]
+        for b in body[:h - 2]:
+            frame.append(A + "│" + RESET + " " + pad(b, w - 3) + A + "│" + RESET)
+        frame.append(A + "╰" + "─" * (w - 2) + "╯" + RESET)
+        for i, f in enumerate(frame):
+            row = top + i
+            if row < len(lines):
+                base = lines[row]
+                lines[row] = pad(base, left) + bg(app.c_bg) + f.replace(RESET, RESET + bg(app.c_bg)) + RESET + fg(app.c_dim) + cells_from(base, left + w) + RESET
+
+
+def cells_from(line, start):
+    """The plain text of `line` from cell `start` on."""
+    out, used = "", 0
+    for c in strip_ansi(line):
+        if used >= start:
+            out += c
+        used += cwidth(c)
+    return out
+
+
+class TextPrompt(Overlay):
+    def __init__(self, app, title, text, done, hint=""):
+        self.app, self.title, self.text, self.done, self.hint = app, title, text, done, hint
+
+    def handle(self, key):
+        if key == "enter":
+            self.app.overlay = None
+            self.done(self.text)
+        elif key == "esc":
+            self.app.overlay = None
+        elif key == "backspace":
+            self.text = self.text[:-1]
+        elif key == "ctrl-u":
+            self.text = ""
+        elif key == "space":
+            self.text += " "
+        elif len(key) == 1 and key.isprintable():
+            self.text += key
+
+    def draw(self, lines, W, H):
+        app = self.app
+        body = [fg(app.c_dim) + clip(self.hint, 70) + RESET, "",
+                fg(app.c_fg) + self.text + fg(app.c_accent) + "█" + RESET, "",
+                fg(app.c_dim) + "enter save · esc cancel · ctrl-u clear" + RESET]
+        self.box(lines, W, H, self.title, body, width=min(W - 4, 76))
+
+
+class FlagsEditor(Overlay):
+    def __init__(self, app, opt):
+        self.app, self.opt = app, opt
+        self.cursor = 0
+
+    def handle(self, key):
+        choices = self.opt["choices"]
+        cur = list(self.app.values[self.opt["key"]])
+        if key in ("down", "j"):
+            self.cursor = (self.cursor + 1) % len(choices)
+        elif key in ("up", "k"):
+            self.cursor = (self.cursor - 1) % len(choices)
+        elif key in ("space", "x"):
+            v = choices[self.cursor]["value"]
+            if v in cur:
+                if len(cur) > 1:
+                    cur.remove(v)
+            else:
+                cur.append(v)
+            order = [c["value"] for c in choices]
+            self.app.values[self.opt["key"]] = sorted(cur, key=order.index)
+            self.app.changed()
+        elif key in ("enter", "esc", "q"):
+            self.app.overlay = None
+
+    def draw(self, lines, W, H):
+        app = self.app
+        cur = app.values[self.opt["key"]]
+        body = [fg(app.c_dim) + "Pick one or more." + RESET, ""]
+        for i, c in enumerate(self.opt["choices"]):
+            box = "◉" if c["value"] in cur else "○"
+            line = (fg(app.c_accent) if c["value"] in cur else fg(app.c_fg)) + box + " " + c["label"] + RESET
+            body.append((bg(app.c_sel) + "› " if i == self.cursor else "  ") + line + RESET)
+        body += ["", fg(app.c_dim) + "space toggle · enter done" + RESET]
+        self.box(lines, W, H, self.opt["title"], body)
+
+
+class ListEditor(Overlay):
+    def __init__(self, app, opt):
+        self.app, self.opt = app, opt
+        self.cursor = 0
+
+    def items(self):
+        return self.app.values[self.opt["key"]]
+
+    def handle(self, key):
+        items = list(self.items())
+        if key in ("down", "j"):
+            self.cursor = min(len(items) - 1, self.cursor + 1) if items else 0
+        elif key in ("up", "k"):
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "a":
+            self.app.overlay = TextPrompt(self.app, "Add " + self.opt.get("itemLabel", "item"), "", self.add, hint=self.opt["description"])
+        elif key == "enter" and items:
+            self.app.overlay = TextPrompt(self.app, "Edit " + self.opt.get("itemLabel", "item"), items[self.cursor], self.replace, hint=self.opt["description"])
+        elif key in ("d", "x", "delete") and items:
+            del items[self.cursor]
+            self.set(items)
+            self.cursor = max(0, min(self.cursor, len(items) - 1))
+        elif key in ("esc", "q"):
+            self.app.overlay = None
+
+    def set(self, items):
+        self.app.values[self.opt["key"]] = items
+        self.app.changed()
+
+    def add(self, text):
+        self.app.overlay = self
+        if text.strip():
+            if not self.valid(text):
+                return
+            self.set(list(self.items()) + [text.strip()])
+            self.cursor = len(self.items()) - 1
+
+    def replace(self, text):
+        self.app.overlay = self
+        items = list(self.items())
+        if text.strip() and self.valid(text):
+            items[self.cursor] = text.strip()
+            self.set(items)
+
+    def valid(self, text):
+        try:
+            re.compile(text)
+        except re.error as e:
+            self.app.flash("Not a valid pattern: %s" % e, error=True)
+            return False
+        return True
+
+    def draw(self, lines, W, H):
+        app = self.app
+        body = [fg(app.c_dim) + line + RESET for line in wrap(self.opt["description"], 64)] + [""]
+        items = self.items()
+        if not items:
+            body.append(fg(app.c_dim) + ITALIC + "(empty)" + RESET)
+        for i, item in enumerate(items):
+            body.append((bg(app.c_sel) + fg(app.c_accent) + "› " if i == self.cursor else "  ") + fg(app.c_fg) + item + RESET)
+        body += ["", fg(app.c_dim) + "a add · enter edit · d delete · esc done" + RESET]
+        self.box(lines, W, H, self.opt["title"], body, width=min(W - 4, 72))
+
+
+class MapEditor(ListEditor):
+    def items(self):
+        return list(self.app.values[self.opt["key"]].items())
+
+    def handle(self, key):
+        items = self.items()
+        if key in ("down", "j"):
+            self.cursor = min(len(items) - 1, self.cursor + 1) if items else 0
+        elif key in ("up", "k"):
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "a":
+            choices = self.opt.get("keyChoices")
+            hint = (self.opt.get("keyLabel", "key") + ": one of " + ", ".join(choices)) if choices else self.opt["description"]
+            self.app.overlay = TextPrompt(self.app, "New " + self.opt.get("keyLabel", "key"), "", self.add_key, hint=hint)
+        elif key == "enter" and items:
+            k, v = items[self.cursor]
+            self.app.overlay = TextPrompt(self.app, "%s → %s" % (k, self.opt.get("valueLabel", "value")), v, lambda t: self.set_value(k, t), hint=self.opt["description"])
+        elif key in ("d", "x", "delete") and items:
+            m = dict(self.app.values[self.opt["key"]])
+            del m[items[self.cursor][0]]
+            self.app.values[self.opt["key"]] = m
+            self.app.changed()
+            self.cursor = max(0, min(self.cursor, len(m) - 1))
+        elif key in ("esc", "q"):
+            self.app.overlay = None
+
+    def add_key(self, text):
+        self.app.overlay = self
+        k = text.strip()
+        choices = self.opt.get("keyChoices")
+        if not k:
+            return
+        if choices and k.lower() not in choices:
+            self.app.flash("Use one of: " + ", ".join(choices), error=True)
+            return
+        if choices:
+            k = k.lower()
+        self.app.overlay = TextPrompt(self.app, "%s → %s" % (k, self.opt.get("valueLabel", "value")), "", lambda t: self.set_value(k, t), hint=self.opt["description"])
+
+    def set_value(self, k, text):
+        self.app.overlay = self
+        m = dict(self.app.values[self.opt["key"]])
+        m[k] = text
+        self.app.values[self.opt["key"]] = m
+        self.app.changed()
+        self.cursor = list(m).index(k)
+
+    def draw(self, lines, W, H):
+        app = self.app
+        body = [fg(app.c_dim) + line + RESET for line in wrap(self.opt["description"], 64)] + [""]
+        items = self.items()
+        if not items:
+            body.append(fg(app.c_dim) + ITALIC + "(empty)" + RESET)
+        kw = max([swidth(k) for k, _ in items] + [4])
+        for i, (k, v) in enumerate(items):
+            sel = (bg(app.c_sel) + fg(app.c_accent) + "› ") if i == self.cursor else "  "
+            body.append(sel + fg(app.c_accent) + pad(k, kw) + RESET + fg(app.c_dim) + "  →  " + fg(app.c_fg) + v + RESET)
+        body += ["", fg(app.c_dim) + "a add · enter edit · d delete · esc done" + RESET]
+        self.box(lines, W, H, self.opt["title"], body, width=min(W - 4, 76))
+
+
+# ------------------------------------------------------------------- main
+
+def main(argv):
+    config = DEFAULT_CONFIG
+    snapshot = None
+    keys = ""
+    use_ipc = True
+    args = iter(argv)
+    for a in args:
+        if a == "--config":
+            config = os.path.expanduser(next(args))
+        elif a == "--snapshot":
+            snapshot = next(args)
+        elif a == "--keys":
+            keys = next(args)
+        elif a == "--no-ipc":
+            use_ipc = False
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            print("keycue-config: unknown option %s (try --help)" % a, file=sys.stderr)
+            return 2
+
+    if snapshot:
+        w, h = (int(x) for x in snapshot.lower().split("x"))
+        app = App(config, use_ipc, w, h)
+        if use_ipc:
+            # Give the background thread a moment to fetch the preview.
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and app.mask() not in app.plugin.levels:
+                time.sleep(0.05)
+        app.term = None
+        for k in parse_key_script(keys):
+            app.handle(k)
+        if app.save_due:
+            app.save()
+            if use_ipc:
+                time.sleep(0.6)
+        sys.stdout.write("\n".join(line + RESET for line in app.frame()) + "\n")
+        return 0
+
+    if not sys.stdin.isatty():
+        print("keycue-config needs a terminal.", file=sys.stderr)
+        return 1
+    App(config, use_ipc).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
